@@ -1,0 +1,76 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: overleaf-teams
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+
+cronjob:
+  enabled: true
+  schedule: "*/1 * * * *"
+  suspend: false
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  backoffLimit: 1
+  restartPolicy: OnFailure
+
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: false
+
+resources: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+existingSecret: ""
+
+secret:
+  authentikToken: ""
+  overleafMongoUri: "mongodb://username:password@ip/domain:port/?authSource=admin&directConnection=true"
+  overleafMongoUsername: ""
+  overleafMongoPassword: ""
+
+config:
+  authentikUrl: ""
+  authentikPageSize: "100"
+  overleafMongoDb: ""
+  overleafMongoHost: ""
+  overleafMongoPort: "27017"
+  overleafMongoAuthDb: "admin"
+  overleafMongoAuthMechanism: ""
+  overleafMongoTls: "false"
+  teams: "TI, DEVOPS, GRC, ANALYSTS, ENG, ALL"
+  createGroups: "true"
+  createTags: "true"
+  applyProjectAccess: "true"
+  overleafTagColor: "#1f75cb"
+
+extraEnv: []
+extraEnvFrom: []
+command: []
+args: []
