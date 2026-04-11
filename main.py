@@ -54,9 +54,9 @@ class ProjectAccessPlan:
 
     def has_changes(self) -> bool:
         for field in PROJECT_ACCESS_FIELDS:
-            if self.current_refs_by_field.get(field, []) != self.desired_refs_by_field.get(
+            if self.current_refs_by_field.get(
                 field, []
-            ):
+            ) != self.desired_refs_by_field.get(field, []):
                 return True
         return False
 
@@ -659,7 +659,9 @@ def build_correlated_users_by_authentik_group(
 
     for group_name in users_by_group:
         users_by_group[group_name].sort(
-            key=lambda item: (item.authentik_username or item.ol_email or item.ol_objectid)
+            key=lambda item: (
+                item.authentik_username or item.ol_email or item.ol_objectid
+            )
         )
 
     return users_by_group
@@ -780,7 +782,9 @@ def build_project_access_plans(
         desired_raw_refs_by_field: dict[str, list[Any]] = {}
 
         for field in PROJECT_ACCESS_FIELDS:
-            _, current_ref_strings = normalize_ref_values(current_raw_refs_by_field[field])
+            _, current_ref_strings = normalize_ref_values(
+                current_raw_refs_by_field[field]
+            )
             current_refs_by_field[field] = current_ref_strings
 
             managed_ref_strings: set[str] = set()
@@ -847,7 +851,8 @@ def build_missing_tag_documents(users: list[User]) -> list[dict[str, Any]]:
                     "color": color,
                     "name": tag_name,
                     "project_ids": [],
-                    "user_id": user.ol_objectid_raw,
+                    # Overleaf stores tag user_id as a string, not an ObjectId.
+                    "user_id": user.ol_objectid,
                 }
             )
 
@@ -1005,7 +1010,9 @@ def main() -> int:
     else:
         print("No missing tags need to be created.")
 
-    changed_project_count = len([plan for plan in project_access_plans if plan.has_changes()])
+    changed_project_count = len(
+        [plan for plan in project_access_plans if plan.has_changes()]
+    )
     if changed_project_count:
         if apply_project_access:
             updated_projects = apply_project_access_plans(
@@ -1026,4 +1033,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
