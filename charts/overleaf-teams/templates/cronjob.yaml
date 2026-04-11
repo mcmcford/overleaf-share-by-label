@@ -1,0 +1,135 @@
+{{- if .Values.cronjob.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "overleaf-teams.fullname" . }}
+  labels:
+    {{- include "overleaf-teams.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.cronjob.schedule | quote }}
+  suspend: {{ .Values.cronjob.suspend }}
+  concurrencyPolicy: {{ .Values.cronjob.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.cronjob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.cronjob.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.cronjob.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            {{- include "overleaf-teams.selectorLabels" . | nindent 12 }}
+            {{- with .Values.podLabels }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.podAnnotations }}
+          annotations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        spec:
+          serviceAccountName: {{ include "overleaf-teams.serviceAccountName" . }}
+          restartPolicy: {{ .Values.cronjob.restartPolicy }}
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: overleaf-teams
+              image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              {{- with .Values.command }}
+              command:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              {{- with .Values.args }}
+              args:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              env:
+                - name: AUTHENTIK_URL
+                  value: {{ .Values.config.authentikUrl | quote }}
+                - name: AUTHENTIK_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "overleaf-teams.secretName" . }}
+                      key: authentik-token
+                - name: AUTHENTIK_PAGE_SIZE
+                  value: {{ .Values.config.authentikPageSize | quote }}
+                - name: OVERLEAF_MONGO_DB
+                  value: {{ .Values.config.overleafMongoDb | quote }}
+                - name: TEAMS
+                  value: {{ .Values.config.teams | quote }}
+                - name: CREATE_GROUPS
+                  value: {{ .Values.config.createGroups | quote }}
+                - name: CREATE_TAGS
+                  value: {{ .Values.config.createTags | quote }}
+                - name: APPLY_PROJECT_ACCESS
+                  value: {{ .Values.config.applyProjectAccess | quote }}
+                - name: OVERLEAF_TAG_COLOR
+                  value: {{ .Values.config.overleafTagColor | quote }}
+                {{- if or .Values.secret.overleafMongoUri .Values.existingSecret }}
+                - name: OVERLEAF_MONGO_URI
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "overleaf-teams.secretName" . }}
+                      key: overleaf-mongo-uri
+                {{- end }}
+                {{- if .Values.config.overleafMongoHost }}
+                - name: OVERLEAF_MONGO_HOST
+                  value: {{ .Values.config.overleafMongoHost | quote }}
+                {{- end }}
+                {{- if .Values.config.overleafMongoPort }}
+                - name: OVERLEAF_MONGO_PORT
+                  value: {{ .Values.config.overleafMongoPort | quote }}
+                {{- end }}
+                {{- if or .Values.secret.overleafMongoUsername .Values.existingSecret }}
+                - name: OVERLEAF_MONGO_USERNAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "overleaf-teams.secretName" . }}
+                      key: overleaf-mongo-username
+                {{- end }}
+                {{- if or .Values.secret.overleafMongoPassword .Values.existingSecret }}
+                - name: OVERLEAF_MONGO_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "overleaf-teams.secretName" . }}
+                      key: overleaf-mongo-password
+                {{- end }}
+                {{- if .Values.config.overleafMongoAuthDb }}
+                - name: OVERLEAF_MONGO_AUTH_DB
+                  value: {{ .Values.config.overleafMongoAuthDb | quote }}
+                {{- end }}
+                {{- if .Values.config.overleafMongoAuthMechanism }}
+                - name: OVERLEAF_MONGO_AUTH_MECHANISM
+                  value: {{ .Values.config.overleafMongoAuthMechanism | quote }}
+                {{- end }}
+                {{- if .Values.config.overleafMongoTls }}
+                - name: OVERLEAF_MONGO_TLS
+                  value: {{ .Values.config.overleafMongoTls | quote }}
+                {{- end }}
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              {{- with .Values.extraEnvFrom }}
+              envFrom:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

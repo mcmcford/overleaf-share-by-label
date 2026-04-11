@@ -1,0 +1,14 @@
+The overleaf-teams release has been installed.
+
+This chart runs the sync process as a CronJob.
+
+Useful commands:
+  kubectl get cronjob {{ include "overleaf-teams.fullname" . }}
+  kubectl get jobs --selector app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl logs job/<job-name>
+
+If you use an existing secret, it must expose these keys:
+  authentik-token
+  overleaf-mongo-uri
+  overleaf-mongo-username
+  overleaf-mongo-password

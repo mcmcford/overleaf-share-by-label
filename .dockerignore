@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+.vscode
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+charts/*/tmp
