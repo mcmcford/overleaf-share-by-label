@@ -27,6 +27,8 @@ ROLE_DEFINITIONS = (
 TEAM_ROLES = tuple(role.key for role in ROLE_DEFINITIONS)
 PROJECT_ACCESS_FIELDS = tuple(role.project_ref_field for role in ROLE_DEFINITIONS)
 DEFAULT_TAG_COLOR = "#1f75cb"
+PROJECT_TAG_SOURCE_MODE_OWNER_ONLY = "owner-only"
+PROJECT_TAG_SOURCE_MODE_ANY_ACCESS = "any-access"
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,34 @@ class TeamRoleMapping:
     authentik_group_name: str
     project_ref_field: str
     precedence: int
+
+
+@dataclass(frozen=True)
+class ManagedTagDocument:
+    tag_object_id: Any
+    user_id: str
+    tag_name: str
+    current_project_ids: list[str]
+    current_raw_project_ids: list[Any]
+
+
+@dataclass(frozen=True)
+class TagSyncPlan:
+    tag_object_id: Any | None
+    user_id: str
+    tag_name: str
+    current_project_ids: list[str]
+    desired_project_ids: list[str]
+    desired_raw_project_ids: list[Any]
+
+    def needs_create(self) -> bool:
+        return self.tag_object_id is None
+
+    def needs_update(self) -> bool:
+        return (
+            self.tag_object_id is not None
+            and self.current_project_ids != self.desired_project_ids
+        )
 
 
 @dataclass
@@ -201,6 +231,32 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_project_tag_source_mode() -> str:
+    """Resolve who is allowed to drive managed project tags."""
+
+    aliases = {
+        "owner-only": PROJECT_TAG_SOURCE_MODE_OWNER_ONLY,
+        "owner_only": PROJECT_TAG_SOURCE_MODE_OWNER_ONLY,
+        "owner": PROJECT_TAG_SOURCE_MODE_OWNER_ONLY,
+        "any-access": PROJECT_TAG_SOURCE_MODE_ANY_ACCESS,
+        "any_access": PROJECT_TAG_SOURCE_MODE_ANY_ACCESS,
+        "collaborative": PROJECT_TAG_SOURCE_MODE_ANY_ACCESS,
+        "shared": PROJECT_TAG_SOURCE_MODE_ANY_ACCESS,
+    }
+    configured_value = os.getenv(
+        "PROJECT_TAG_SOURCE_MODE", PROJECT_TAG_SOURCE_MODE_OWNER_ONLY
+    )
+    normalized_value = aliases.get(configured_value.strip().lower())
+
+    if normalized_value is None:
+        raise SystemExit(
+            "PROJECT_TAG_SOURCE_MODE must be one of: "
+            f"{PROJECT_TAG_SOURCE_MODE_OWNER_ONLY}, {PROJECT_TAG_SOURCE_MODE_ANY_ACCESS}"
+        )
+
+    return normalized_value
 
 
 def build_overleaf_mongo_uri() -> str:
@@ -643,6 +699,33 @@ def build_tags_by_project_id(tags: list[dict[str, Any]]) -> dict[str, set[str]]:
     return tags_by_project_id
 
 
+def build_project_tag_sources_by_project(
+    tags: list[dict[str, Any]], managed_tag_names: set[str]
+) -> dict[str, dict[str, set[str]]]:
+    """Index managed project tags by project id and the user who applied them."""
+
+    project_tag_sources: dict[str, dict[str, set[str]]] = {}
+
+    for tag in tags:
+        user_id = str(tag.get("user_id") or "").strip()
+        tag_name = str(tag.get("name") or "").strip()
+        if not user_id or tag_name not in managed_tag_names:
+            continue
+
+        seen_project_ids: set[str] = set()
+        for raw_project_id in tag.get("project_ids", []):
+            project_id = str(raw_project_id).strip()
+            if not project_id or project_id in seen_project_ids:
+                continue
+
+            seen_project_ids.add(project_id)
+            project_tag_sources.setdefault(project_id, {}).setdefault(
+                tag_name, set()
+            ).add(user_id)
+
+    return project_tag_sources
+
+
 def build_correlated_users_by_authentik_group(
     correlated_users: list[User],
 ) -> dict[str, list[User]]:
@@ -747,11 +830,15 @@ def build_project_access_plans(
     tags: list[dict[str, Any]],
     team_role_mappings: list[TeamRoleMapping],
     correlated_users: list[User],
+    project_tag_source_mode: str,
 ) -> list[ProjectAccessPlan]:
     """Resolve project tags into desired Overleaf access lists."""
 
     users_by_group = build_correlated_users_by_authentik_group(correlated_users)
-    tags_by_project_id = build_tags_by_project_id(tags)
+    managed_tag_names = set(build_expected_tag_names(team_role_mappings))
+    project_tag_sources_by_project = build_project_tag_sources_by_project(
+        tags, managed_tag_names
+    )
     mappings_by_tag_name = {mapping.tag_name: mapping for mapping in team_role_mappings}
     all_mappings_by_field: dict[str, list[TeamRoleMapping]] = {
         field: [
@@ -769,10 +856,6 @@ def build_project_access_plans(
         project_id = str(project_object_id)
         project_name = str(project.get("name") or project_id)
         owner_ref = str(project.get("owner_ref") or "").strip()
-        applied_tags = sorted(tags_by_project_id.get(project_id, set()))
-        selected_mappings, suppressed_tags = select_project_role_mappings(
-            applied_tags, mappings_by_tag_name
-        )
 
         current_raw_refs_by_field: dict[str, list[Any]] = {
             field: list(project.get(field, [])) for field in PROJECT_ACCESS_FIELDS
@@ -781,12 +864,33 @@ def build_project_access_plans(
         desired_refs_by_field: dict[str, list[str]] = {}
         desired_raw_refs_by_field: dict[str, list[Any]] = {}
 
+        current_access_user_ids: set[str] = {owner_ref} if owner_ref else set()
+
         for field in PROJECT_ACCESS_FIELDS:
             _, current_ref_strings = normalize_ref_values(
                 current_raw_refs_by_field[field]
             )
             current_refs_by_field[field] = current_ref_strings
+            current_access_user_ids.update(current_ref_strings)
 
+        applied_tags = sorted(project_tag_sources_by_project.get(project_id, {}).keys())
+        allowed_tag_source_user_ids = (
+            {owner_ref}
+            if project_tag_source_mode == PROJECT_TAG_SOURCE_MODE_OWNER_ONLY
+            else current_access_user_ids
+        )
+        effective_tag_names = sorted(
+            tag_name
+            for tag_name, source_user_ids in project_tag_sources_by_project.get(
+                project_id, {}
+            ).items()
+            if source_user_ids & allowed_tag_source_user_ids
+        )
+        selected_mappings, suppressed_tags = select_project_role_mappings(
+            effective_tag_names, mappings_by_tag_name
+        )
+
+        for field in PROJECT_ACCESS_FIELDS:
             managed_ref_strings: set[str] = set()
             desired_managed_raw_refs: list[Any] = []
 
@@ -834,6 +938,188 @@ def build_project_access_plans(
     return project_access_plans
 
 
+def build_project_tag_viewer_ids(project_access_plan: ProjectAccessPlan) -> list[str]:
+    """Return every user who should see the managed tags on a project."""
+
+    viewer_ids: list[str] = []
+    seen: set[str] = set()
+
+    for user_id in [project_access_plan.owner_ref] + [
+        ref
+        for field in PROJECT_ACCESS_FIELDS
+        for ref in project_access_plan.desired_refs_by_field[field]
+    ]:
+        normalized_user_id = str(user_id).strip()
+        if not normalized_user_id or normalized_user_id in seen:
+            continue
+
+        seen.add(normalized_user_id)
+        viewer_ids.append(normalized_user_id)
+
+    return viewer_ids
+
+
+def build_tag_sync_plans(
+    tags: list[dict[str, Any]],
+    team_role_mappings: list[TeamRoleMapping],
+    correlated_users: list[User],
+    project_access_plans: list[ProjectAccessPlan],
+) -> list[TagSyncPlan]:
+    """Build create/update plans for managed tag documents and their project visibility."""
+
+    managed_tag_names = build_expected_tag_names(team_role_mappings)
+    managed_tag_name_set = set(managed_tag_names)
+    existing_docs_by_pair: dict[tuple[str, str], list[ManagedTagDocument]] = {}
+
+    for tag in tags:
+        user_id = str(tag.get("user_id") or "").strip()
+        tag_name = str(tag.get("name") or "").strip()
+        if not user_id or tag_name not in managed_tag_name_set:
+            continue
+
+        current_raw_project_ids, current_project_ids = normalize_ref_values(
+            list(tag.get("project_ids", []))
+        )
+        existing_docs_by_pair.setdefault((user_id, tag_name), []).append(
+            ManagedTagDocument(
+                tag_object_id=tag.get("_id"),
+                user_id=user_id,
+                tag_name=tag_name,
+                current_project_ids=current_project_ids,
+                current_raw_project_ids=current_raw_project_ids,
+            )
+        )
+
+    desired_pairs: set[tuple[str, str]] = set()
+    desired_raw_project_ids_by_pair: dict[tuple[str, str], list[Any]] = {}
+
+    for user in correlated_users:
+        if not user.is_correlated():
+            continue
+
+        for tag_name in managed_tag_names:
+            desired_pairs.add((user.ol_objectid, tag_name))
+
+    for plan in project_access_plans:
+        selected_tag_names = [mapping.tag_name for mapping in plan.selected_mappings]
+        viewer_ids = build_project_tag_viewer_ids(plan)
+
+        for viewer_id in viewer_ids:
+            for tag_name in managed_tag_names:
+                desired_pairs.add((viewer_id, tag_name))
+
+        for tag_name in selected_tag_names:
+            for viewer_id in viewer_ids:
+                pair = (viewer_id, tag_name)
+                desired_pairs.add(pair)
+                desired_raw_project_ids_by_pair.setdefault(pair, []).append(
+                    plan.project_id
+                )
+
+    sync_plans: list[TagSyncPlan] = []
+    all_pairs = sorted(set(existing_docs_by_pair) | desired_pairs)
+
+    for pair in all_pairs:
+        desired_raw_project_ids, desired_project_ids = normalize_ref_values(
+            desired_raw_project_ids_by_pair.get(pair, [])
+        )
+        existing_docs = existing_docs_by_pair.get(pair, [])
+
+        if existing_docs:
+            for existing_doc in existing_docs:
+                sync_plans.append(
+                    TagSyncPlan(
+                        tag_object_id=existing_doc.tag_object_id,
+                        user_id=existing_doc.user_id,
+                        tag_name=existing_doc.tag_name,
+                        current_project_ids=existing_doc.current_project_ids,
+                        desired_project_ids=desired_project_ids,
+                        desired_raw_project_ids=desired_raw_project_ids,
+                    )
+                )
+            continue
+
+        sync_plans.append(
+            TagSyncPlan(
+                tag_object_id=None,
+                user_id=pair[0],
+                tag_name=pair[1],
+                current_project_ids=[],
+                desired_project_ids=desired_project_ids,
+                desired_raw_project_ids=desired_raw_project_ids,
+            )
+        )
+
+    return sync_plans
+
+
+def build_tag_documents_to_create(
+    tag_sync_plans: list[TagSyncPlan],
+) -> list[dict[str, Any]]:
+    """Build new tag documents for missing managed tags."""
+
+    color = os.getenv("OVERLEAF_TAG_COLOR", DEFAULT_TAG_COLOR)
+    tag_documents: list[dict[str, Any]] = []
+
+    for plan in tag_sync_plans:
+        if not plan.needs_create():
+            continue
+
+        tag_documents.append(
+            {
+                "__v": 0,
+                "color": color,
+                "name": plan.tag_name,
+                "project_ids": plan.desired_raw_project_ids,
+                "user_id": plan.user_id,
+            }
+        )
+
+    return tag_documents
+
+
+def apply_tag_sync_plans(
+    mongo_uri: str,
+    mongo_database: str,
+    tag_sync_plans: list[TagSyncPlan],
+    collection_name: str = "tags",
+) -> tuple[int, int]:
+    """Create missing managed tags and sync project_ids on existing tag documents."""
+
+    tags_to_create = build_tag_documents_to_create(tag_sync_plans)
+    plans_to_update = [plan for plan in tag_sync_plans if plan.needs_update()]
+
+    if not tags_to_create and not plans_to_update:
+        return 0, 0
+
+    client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
+
+    try:
+        client.admin.command("ping")
+        collection = client[mongo_database][collection_name]
+
+        created_count = 0
+        updated_count = 0
+
+        if tags_to_create:
+            created_count = len(
+                collection.insert_many(tags_to_create, ordered=True).inserted_ids
+            )
+
+        for plan in plans_to_update:
+            collection.update_one(
+                {"_id": plan.tag_object_id},
+                {"$set": {"project_ids": plan.desired_raw_project_ids}},
+            )
+            updated_count += 1
+
+        return created_count, updated_count
+    except PyMongoError as exc:
+        raise SystemExit(f"Could not sync tags in MongoDB: {exc}") from exc
+    finally:
+        client.close()
+
+
 def build_missing_tag_documents(users: list[User]) -> list[dict[str, Any]]:
     """Build MongoDB tag documents for every missing tag on matched users."""
 
@@ -864,7 +1150,23 @@ def print_tag_creation_plan(tags_to_create: list[dict[str, Any]]) -> None:
 
     print(f"Prepared {len(tags_to_create)} tag(s) to create:")
     for tag in tags_to_create:
-        print(f"- user_id={tag['user_id']} | name={tag['name']} | color={tag['color']}")
+        print(
+            f"- user_id={tag['user_id']} | name={tag['name']} | color={tag['color']} | "
+            f"project_ids={[str(project_id) for project_id in tag['project_ids']]}"
+        )
+
+
+def print_tag_project_update_plan(tag_sync_plans: list[TagSyncPlan]) -> None:
+    """Print the managed tag documents whose project visibility will change."""
+
+    plans_to_update = [plan for plan in tag_sync_plans if plan.needs_update()]
+    print(f"Prepared {len(plans_to_update)} existing tag document(s) to update:")
+
+    for plan in plans_to_update:
+        print(
+            f"- user_id={plan.user_id} | name={plan.tag_name} | "
+            f"current={plan.current_project_ids} | desired={plan.desired_project_ids}"
+        )
 
 
 def print_tag_audit(users: list[User]) -> None:
@@ -946,6 +1248,7 @@ def main() -> int:
     create_groups = env_bool("CREATE_GROUPS", default=True)
     create_tags = env_bool("CREATE_TAGS", default=False)
     apply_project_access = env_bool("APPLY_PROJECT_ACCESS", default=False)
+    project_tag_source_mode = get_project_tag_source_mode()
 
     teams = [team.strip() for team in teams if team.strip()]
     team_role_mappings = build_team_role_mappings(teams)
@@ -982,33 +1285,49 @@ def main() -> int:
     correlated_users = correlate_users(overleaf_users, authentik_users)
     users_by_group = build_correlated_users_by_authentik_group(correlated_users)
     audited_users = audit_user_tags(correlated_users, overleaf_tags, team_role_mappings)
-    missing_tag_documents = build_missing_tag_documents(audited_users)
     project_access_plans = build_project_access_plans(
         overleaf_projects,
         overleaf_tags,
         team_role_mappings,
         correlated_users,
+        project_tag_source_mode,
     )
 
     print(f"Extracted {len(authentik_users)} Authentik user(s) from groups")
     print_correlated_users(correlated_users)
     print_team_role_mappings(team_role_mappings, users_by_group)
     print_tag_audit(audited_users)
+    print(f"Managed project tag mode: {project_tag_source_mode}")
     print_project_access_plans(project_access_plans)
 
-    if missing_tag_documents:
-        print_tag_creation_plan(missing_tag_documents)
+    tag_sync_plans = build_tag_sync_plans(
+        overleaf_tags,
+        team_role_mappings,
+        correlated_users,
+        project_access_plans,
+    )
+    tags_to_create = build_tag_documents_to_create(tag_sync_plans)
+    tag_update_plans = [plan for plan in tag_sync_plans if plan.needs_update()]
+
+    if tags_to_create:
+        print_tag_creation_plan(tags_to_create)
+    if tag_update_plans:
+        print_tag_project_update_plan(tag_update_plans)
+
+    if tags_to_create or tag_update_plans:
         if create_tags:
-            created_count = create_overleaf_tags(
+            created_count, updated_count = apply_tag_sync_plans(
                 overleaf_mongo_uri,
                 overleaf_mongo_db,
-                missing_tag_documents,
+                tag_sync_plans,
             )
-            print(f"Created {created_count} missing tag(s) in Overleaf MongoDB")
+            print(
+                f"Created {created_count} tag(s) and updated {updated_count} tag document(s) in Overleaf MongoDB"
+            )
         else:
-            print("CREATE_TAGS is false, so no tags were created.")
+            print("CREATE_TAGS is false, so tag documents were not created or updated.")
     else:
-        print("No missing tags need to be created.")
+        print("No tag document changes are required.")
 
     changed_project_count = len(
         [plan for plan in project_access_plans if plan.has_changes()]

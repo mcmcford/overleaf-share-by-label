@@ -68,6 +68,8 @@ spec:
                   value: {{ .Values.config.createTags | quote }}
                 - name: APPLY_PROJECT_ACCESS
                   value: {{ .Values.config.applyProjectAccess | quote }}
+                - name: PROJECT_TAG_SOURCE_MODE
+                  value: {{ .Values.config.projectTagSourceMode | quote }}
                 - name: OVERLEAF_TAG_COLOR
                   value: {{ .Values.config.overleafTagColor | quote }}
                 {{- if or .Values.secret.overleafMongoUri .Values.existingSecret }}

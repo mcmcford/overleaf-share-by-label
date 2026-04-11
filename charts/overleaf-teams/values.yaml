@@ -68,6 +68,8 @@ config:
   createGroups: "true"
   createTags: "true"
   applyProjectAccess: "true"
+  # projectTagSourceMode can be "owner-only" or "any-access"
+  projectTagSourceMode: "owner-only"
   overleafTagColor: "#1f75cb"
 
 extraEnv: []
