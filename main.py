@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -27,6 +28,8 @@ ROLE_DEFINITIONS = (
 TEAM_ROLES = tuple(role.key for role in ROLE_DEFINITIONS)
 PROJECT_ACCESS_FIELDS = tuple(role.project_ref_field for role in ROLE_DEFINITIONS)
 DEFAULT_TAG_COLOR = "#1f75cb"
+DEFAULT_ACTIVE_TAG_COLOR = "#2f9e44"
+DEFAULT_PROJECT_ACCESS_STATE_COLLECTION = "project_access_states"
 PROJECT_TAG_SOURCE_MODE_OWNER_ONLY = "owner-only"
 PROJECT_TAG_SOURCE_MODE_ANY_ACCESS = "any-access"
 
@@ -46,6 +49,7 @@ class ManagedTagDocument:
     tag_object_id: Any
     user_id: str
     tag_name: str
+    current_color: str
     current_project_ids: list[str]
     current_raw_project_ids: list[Any]
 
@@ -55,17 +59,54 @@ class TagSyncPlan:
     tag_object_id: Any | None
     user_id: str
     tag_name: str
+    current_color: str
+    desired_color: str
     current_project_ids: list[str]
     desired_project_ids: list[str]
     desired_raw_project_ids: list[Any]
+    delete_document: bool = False
 
     def needs_create(self) -> bool:
-        return self.tag_object_id is None
+        return self.tag_object_id is None and not self.delete_document
+
+    def needs_delete(self) -> bool:
+        return self.tag_object_id is not None and self.delete_document
 
     def needs_update(self) -> bool:
         return (
             self.tag_object_id is not None
-            and self.current_project_ids != self.desired_project_ids
+            and not self.delete_document
+            and (
+                self.current_project_ids != self.desired_project_ids
+                or self.current_color != self.desired_color
+            )
+        )
+
+
+@dataclass(frozen=True)
+class ManagedProjectAccessStateDocument:
+    state_object_id: Any
+    project_id: str
+    current_managed_refs_by_field: dict[str, list[str]]
+    current_managed_raw_refs_by_field: dict[str, list[Any]]
+
+
+@dataclass(frozen=True)
+class ProjectAccessStateSyncPlan:
+    state_object_id: Any | None
+    project_id: str
+    project_name: str
+    current_managed_refs_by_field: dict[str, list[str]]
+    desired_managed_refs_by_field: dict[str, list[str]]
+    desired_managed_raw_refs_by_field: dict[str, list[Any]]
+
+    def needs_create(self) -> bool:
+        return self.state_object_id is None
+
+    def needs_update(self) -> bool:
+        return (
+            self.state_object_id is not None
+            and self.current_managed_refs_by_field != self.desired_managed_refs_by_field
         )
 
 
@@ -79,8 +120,11 @@ class ProjectAccessPlan:
     suppressed_tags: list[str]
     selected_mappings: list[TeamRoleMapping]
     current_refs_by_field: dict[str, list[str]]
+    current_managed_refs_by_field: dict[str, list[str]]
     desired_refs_by_field: dict[str, list[str]]
     desired_raw_refs_by_field: dict[str, list[Any]]
+    desired_managed_refs_by_field: dict[str, list[str]]
+    desired_managed_raw_refs_by_field: dict[str, list[Any]]
 
     def has_changes(self) -> bool:
         for field in PROJECT_ACCESS_FIELDS:
@@ -347,6 +391,27 @@ def fetch_overleaf_projects(
         client.close()
 
 
+def fetch_project_access_states(
+    mongo_uri: str,
+    mongo_database: str,
+    collection_name: str = DEFAULT_PROJECT_ACCESS_STATE_COLLECTION,
+) -> list[dict[str, Any]]:
+    """Return the stored project access state documents used for managed-share reconciliation."""
+
+    client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
+
+    try:
+        client.admin.command("ping")
+        collection = client[mongo_database][collection_name]
+        return list(collection.find({}))
+    except PyMongoError as exc:
+        raise SystemExit(
+            f"Could not read project access state from MongoDB: {exc}"
+        ) from exc
+    finally:
+        client.close()
+
+
 def create_overleaf_tags(
     mongo_uri: str,
     mongo_database: str,
@@ -403,6 +468,74 @@ def apply_project_access_plans(
         return len(changed_plans)
     except PyMongoError as exc:
         raise SystemExit(f"Could not update projects in MongoDB: {exc}") from exc
+    finally:
+        client.close()
+
+
+def apply_project_access_state_sync_plans(
+    mongo_uri: str,
+    mongo_database: str,
+    state_sync_plans: list[ProjectAccessStateSyncPlan],
+    collection_name: str = DEFAULT_PROJECT_ACCESS_STATE_COLLECTION,
+) -> tuple[int, int]:
+    """Persist the managed project access state used to preserve manual shares."""
+
+    plans_to_create = [plan for plan in state_sync_plans if plan.needs_create()]
+    plans_to_update = [plan for plan in state_sync_plans if plan.needs_update()]
+
+    if not plans_to_create and not plans_to_update:
+        return 0, 0
+
+    client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
+
+    try:
+        client.admin.command("ping")
+        collection = client[mongo_database][collection_name]
+        timestamp = datetime.now(UTC)
+        created_count = 0
+        updated_count = 0
+
+        if plans_to_create:
+            documents = []
+            for plan in plans_to_create:
+                documents.append(
+                    {
+                        "project_id": plan.project_id,
+                        "project_name": plan.project_name,
+                        "managed_refs_by_field": {
+                            field: plan.desired_managed_raw_refs_by_field[field]
+                            for field in PROJECT_ACCESS_FIELDS
+                        },
+                        "created_at": timestamp,
+                        "updated_at": timestamp,
+                    }
+                )
+
+            created_count = len(
+                collection.insert_many(documents, ordered=True).inserted_ids
+            )
+
+        for plan in plans_to_update:
+            collection.update_one(
+                {"_id": plan.state_object_id},
+                {
+                    "$set": {
+                        "project_name": plan.project_name,
+                        "managed_refs_by_field": {
+                            field: plan.desired_managed_raw_refs_by_field[field]
+                            for field in PROJECT_ACCESS_FIELDS
+                        },
+                        "updated_at": timestamp,
+                    }
+                },
+            )
+            updated_count += 1
+
+        return created_count, updated_count
+    except PyMongoError as exc:
+        raise SystemExit(
+            f"Could not sync project access state in MongoDB: {exc}"
+        ) from exc
     finally:
         client.close()
 
@@ -665,6 +798,70 @@ def build_expected_tag_names(team_role_mappings: list[TeamRoleMapping]) -> list[
     return sorted({mapping.tag_name for mapping in team_role_mappings})
 
 
+def build_managed_authentik_group_names(
+    team_role_mappings: list[TeamRoleMapping],
+) -> set[str]:
+    """Return the Authentik groups that make a user eligible for managed tags."""
+
+    return {mapping.authentik_group_name for mapping in team_role_mappings}
+
+
+def build_tag_eligible_user_ids(
+    correlated_users: list[User], team_role_mappings: list[TeamRoleMapping]
+) -> set[str]:
+    """Return correlated Overleaf user ids that belong to at least one managed team group."""
+
+    managed_group_names = build_managed_authentik_group_names(team_role_mappings)
+
+    return {
+        user.ol_objectid
+        for user in correlated_users
+        if user.is_correlated()
+        and managed_group_names.intersection(user.authentik_group_names)
+    }
+
+
+def build_active_tag_names_by_user_id(
+    correlated_users: list[User], team_role_mappings: list[TeamRoleMapping]
+) -> dict[str, set[str]]:
+    """Return the managed tags that should be highlighted for each eligible user."""
+
+    mappings_by_group_name: dict[str, list[TeamRoleMapping]] = {}
+    for mapping in team_role_mappings:
+        mappings_by_group_name.setdefault(mapping.authentik_group_name, []).append(
+            mapping
+        )
+
+    active_tag_names_by_user_id: dict[str, set[str]] = {}
+
+    for user in correlated_users:
+        if not user.is_correlated():
+            continue
+
+        active_tag_names: set[str] = set()
+        for group_name in user.authentik_group_names:
+            for mapping in mappings_by_group_name.get(group_name, []):
+                active_tag_names.add(mapping.tag_name)
+
+        active_tag_names_by_user_id[user.ol_objectid] = active_tag_names
+
+    return active_tag_names_by_user_id
+
+
+def resolve_tag_color(
+    user_id: str, tag_name: str, active_tag_names_by_user_id: dict[str, set[str]]
+) -> str:
+    """Return the display color for a managed tag on a specific user's account."""
+
+    default_color = os.getenv("OVERLEAF_TAG_COLOR", DEFAULT_TAG_COLOR)
+    active_color = os.getenv("OVERLEAF_ACTIVE_TAG_COLOR", DEFAULT_ACTIVE_TAG_COLOR)
+
+    if tag_name in active_tag_names_by_user_id.get(user_id, set()):
+        return active_color
+
+    return default_color
+
+
 def build_tags_by_user_id(tags: list[dict[str, Any]]) -> dict[str, set[str]]:
     """Index Overleaf tags by their owning user id."""
 
@@ -804,6 +1001,39 @@ def normalize_ref_values(raw_refs: list[Any]) -> tuple[list[Any], list[str]]:
     return unique_raw_refs, unique_ref_strings
 
 
+def build_project_access_state_by_project_id(
+    state_documents: list[dict[str, Any]],
+) -> dict[str, ManagedProjectAccessStateDocument]:
+    """Index persisted managed project access state by project id."""
+
+    state_by_project_id: dict[str, ManagedProjectAccessStateDocument] = {}
+
+    for document in state_documents:
+        project_id = str(document.get("project_id") or "").strip()
+        if not project_id:
+            continue
+
+        raw_refs_by_field = document.get("managed_refs_by_field") or {}
+        current_managed_refs_by_field: dict[str, list[str]] = {}
+        current_managed_raw_refs_by_field: dict[str, list[Any]] = {}
+
+        for field in PROJECT_ACCESS_FIELDS:
+            raw_refs, ref_strings = normalize_ref_values(
+                list(raw_refs_by_field.get(field, []))
+            )
+            current_managed_raw_refs_by_field[field] = raw_refs
+            current_managed_refs_by_field[field] = ref_strings
+
+        state_by_project_id[project_id] = ManagedProjectAccessStateDocument(
+            state_object_id=document.get("_id"),
+            project_id=project_id,
+            current_managed_refs_by_field=current_managed_refs_by_field,
+            current_managed_raw_refs_by_field=current_managed_raw_refs_by_field,
+        )
+
+    return state_by_project_id
+
+
 def audit_user_tags(
     correlated_users: list[User],
     tags: list[dict[str, Any]],
@@ -813,12 +1043,17 @@ def audit_user_tags(
 
     tags_by_user_id = build_tags_by_user_id(tags)
     expected_tag_names = build_expected_tag_names(team_role_mappings)
+    eligible_user_ids = build_tag_eligible_user_ids(
+        correlated_users, team_role_mappings
+    )
 
     for user in correlated_users:
         if not user.is_correlated():
             continue
 
-        user.expected_tags = expected_tag_names
+        user.expected_tags = (
+            expected_tag_names if user.ol_objectid in eligible_user_ids else []
+        )
         user.current_tags = sorted(tags_by_user_id.get(user.ol_objectid, set()))
         user.missing_tags = sorted(set(user.expected_tags) - set(user.current_tags))
 
@@ -828,6 +1063,7 @@ def audit_user_tags(
 def build_project_access_plans(
     projects: list[dict[str, Any]],
     tags: list[dict[str, Any]],
+    project_access_state_documents: list[dict[str, Any]],
     team_role_mappings: list[TeamRoleMapping],
     correlated_users: list[User],
     project_tag_source_mode: str,
@@ -836,18 +1072,13 @@ def build_project_access_plans(
 
     users_by_group = build_correlated_users_by_authentik_group(correlated_users)
     managed_tag_names = set(build_expected_tag_names(team_role_mappings))
+    project_access_state_by_project_id = build_project_access_state_by_project_id(
+        project_access_state_documents
+    )
     project_tag_sources_by_project = build_project_tag_sources_by_project(
         tags, managed_tag_names
     )
     mappings_by_tag_name = {mapping.tag_name: mapping for mapping in team_role_mappings}
-    all_mappings_by_field: dict[str, list[TeamRoleMapping]] = {
-        field: [
-            mapping
-            for mapping in team_role_mappings
-            if mapping.project_ref_field == field
-        ]
-        for field in PROJECT_ACCESS_FIELDS
-    }
 
     project_access_plans: list[ProjectAccessPlan] = []
 
@@ -860,9 +1091,13 @@ def build_project_access_plans(
         current_raw_refs_by_field: dict[str, list[Any]] = {
             field: list(project.get(field, [])) for field in PROJECT_ACCESS_FIELDS
         }
+        current_state = project_access_state_by_project_id.get(project_id)
         current_refs_by_field: dict[str, list[str]] = {}
+        current_managed_refs_by_field: dict[str, list[str]] = {}
         desired_refs_by_field: dict[str, list[str]] = {}
         desired_raw_refs_by_field: dict[str, list[Any]] = {}
+        desired_managed_refs_by_field: dict[str, list[str]] = {}
+        desired_managed_raw_refs_by_field: dict[str, list[Any]] = {}
 
         current_access_user_ids: set[str] = {owner_ref} if owner_ref else set()
 
@@ -891,14 +1126,13 @@ def build_project_access_plans(
         )
 
         for field in PROJECT_ACCESS_FIELDS:
-            managed_ref_strings: set[str] = set()
+            previous_managed_ref_strings = (
+                list(current_state.current_managed_refs_by_field.get(field, []))
+                if current_state is not None
+                else []
+            )
+            current_managed_refs_by_field[field] = previous_managed_ref_strings
             desired_managed_raw_refs: list[Any] = []
-
-            for mapping in all_mappings_by_field[field]:
-                for user in find_overleaf_users_for_mapping(mapping, users_by_group):
-                    if user.ol_objectid == owner_ref:
-                        continue
-                    managed_ref_strings.add(user.ol_objectid)
 
             for mapping in selected_mappings:
                 if mapping.project_ref_field != field:
@@ -908,10 +1142,16 @@ def build_project_access_plans(
                         continue
                     desired_managed_raw_refs.append(user.ol_objectid_raw)
 
+            desired_managed_raw_refs, desired_managed_ref_strings = (
+                normalize_ref_values(desired_managed_raw_refs)
+            )
+            desired_managed_raw_refs_by_field[field] = desired_managed_raw_refs
+            desired_managed_refs_by_field[field] = desired_managed_ref_strings
+
             preserved_manual_raw_refs = [
                 raw_ref
                 for raw_ref in current_raw_refs_by_field[field]
-                if str(raw_ref).strip() not in managed_ref_strings
+                if str(raw_ref).strip() not in set(previous_managed_ref_strings)
             ]
             desired_raw_refs, desired_ref_strings = normalize_ref_values(
                 preserved_manual_raw_refs + desired_managed_raw_refs
@@ -930,16 +1170,52 @@ def build_project_access_plans(
                 suppressed_tags=suppressed_tags,
                 selected_mappings=selected_mappings,
                 current_refs_by_field=current_refs_by_field,
+                current_managed_refs_by_field=current_managed_refs_by_field,
                 desired_refs_by_field=desired_refs_by_field,
                 desired_raw_refs_by_field=desired_raw_refs_by_field,
+                desired_managed_refs_by_field=desired_managed_refs_by_field,
+                desired_managed_raw_refs_by_field=desired_managed_raw_refs_by_field,
             )
         )
 
     return project_access_plans
 
 
+def build_project_access_state_sync_plans(
+    project_access_plans: list[ProjectAccessPlan],
+    project_access_state_documents: list[dict[str, Any]],
+) -> list[ProjectAccessStateSyncPlan]:
+    """Build the persisted managed-share state that distinguishes manual from managed refs."""
+
+    state_by_project_id = build_project_access_state_by_project_id(
+        project_access_state_documents
+    )
+    sync_plans: list[ProjectAccessStateSyncPlan] = []
+
+    for plan in project_access_plans:
+        current_state = state_by_project_id.get(plan.project_id)
+        sync_plans.append(
+            ProjectAccessStateSyncPlan(
+                state_object_id=(
+                    current_state.state_object_id if current_state else None
+                ),
+                project_id=plan.project_id,
+                project_name=plan.project_name,
+                current_managed_refs_by_field=(
+                    current_state.current_managed_refs_by_field
+                    if current_state is not None
+                    else {field: [] for field in PROJECT_ACCESS_FIELDS}
+                ),
+                desired_managed_refs_by_field=plan.desired_managed_refs_by_field,
+                desired_managed_raw_refs_by_field=plan.desired_managed_raw_refs_by_field,
+            )
+        )
+
+    return sync_plans
+
+
 def build_project_tag_viewer_ids(project_access_plan: ProjectAccessPlan) -> list[str]:
-    """Return every user who should see the managed tags on a project."""
+    """Return the owner and tag-managed users who should see managed tags."""
 
     viewer_ids: list[str] = []
     seen: set[str] = set()
@@ -947,7 +1223,7 @@ def build_project_tag_viewer_ids(project_access_plan: ProjectAccessPlan) -> list
     for user_id in [project_access_plan.owner_ref] + [
         ref
         for field in PROJECT_ACCESS_FIELDS
-        for ref in project_access_plan.desired_refs_by_field[field]
+        for ref in project_access_plan.desired_managed_refs_by_field[field]
     ]:
         normalized_user_id = str(user_id).strip()
         if not normalized_user_id or normalized_user_id in seen:
@@ -969,6 +1245,12 @@ def build_tag_sync_plans(
 
     managed_tag_names = build_expected_tag_names(team_role_mappings)
     managed_tag_name_set = set(managed_tag_names)
+    eligible_user_ids = build_tag_eligible_user_ids(
+        correlated_users, team_role_mappings
+    )
+    active_tag_names_by_user_id = build_active_tag_names_by_user_id(
+        correlated_users, team_role_mappings
+    )
     existing_docs_by_pair: dict[tuple[str, str], list[ManagedTagDocument]] = {}
 
     for tag in tags:
@@ -985,6 +1267,7 @@ def build_tag_sync_plans(
                 tag_object_id=tag.get("_id"),
                 user_id=user_id,
                 tag_name=tag_name,
+                current_color=str(tag.get("color") or "").strip(),
                 current_project_ids=current_project_ids,
                 current_raw_project_ids=current_raw_project_ids,
             )
@@ -994,7 +1277,7 @@ def build_tag_sync_plans(
     desired_raw_project_ids_by_pair: dict[tuple[str, str], list[Any]] = {}
 
     for user in correlated_users:
-        if not user.is_correlated():
+        if not user.is_correlated() or user.ol_objectid not in eligible_user_ids:
             continue
 
         for tag_name in managed_tag_names:
@@ -1005,11 +1288,15 @@ def build_tag_sync_plans(
         viewer_ids = build_project_tag_viewer_ids(plan)
 
         for viewer_id in viewer_ids:
+            if viewer_id not in eligible_user_ids:
+                continue
             for tag_name in managed_tag_names:
                 desired_pairs.add((viewer_id, tag_name))
 
         for tag_name in selected_tag_names:
             for viewer_id in viewer_ids:
+                if viewer_id not in eligible_user_ids:
+                    continue
                 pair = (viewer_id, tag_name)
                 desired_pairs.add(pair)
                 desired_raw_project_ids_by_pair.setdefault(pair, []).append(
@@ -1032,9 +1319,16 @@ def build_tag_sync_plans(
                         tag_object_id=existing_doc.tag_object_id,
                         user_id=existing_doc.user_id,
                         tag_name=existing_doc.tag_name,
+                        current_color=existing_doc.current_color,
+                        desired_color=resolve_tag_color(
+                            existing_doc.user_id,
+                            existing_doc.tag_name,
+                            active_tag_names_by_user_id,
+                        ),
                         current_project_ids=existing_doc.current_project_ids,
                         desired_project_ids=desired_project_ids,
                         desired_raw_project_ids=desired_raw_project_ids,
+                        delete_document=existing_doc.user_id not in eligible_user_ids,
                     )
                 )
             continue
@@ -1044,6 +1338,12 @@ def build_tag_sync_plans(
                 tag_object_id=None,
                 user_id=pair[0],
                 tag_name=pair[1],
+                current_color="",
+                desired_color=resolve_tag_color(
+                    pair[0],
+                    pair[1],
+                    active_tag_names_by_user_id,
+                ),
                 current_project_ids=[],
                 desired_project_ids=desired_project_ids,
                 desired_raw_project_ids=desired_raw_project_ids,
@@ -1057,8 +1357,6 @@ def build_tag_documents_to_create(
     tag_sync_plans: list[TagSyncPlan],
 ) -> list[dict[str, Any]]:
     """Build new tag documents for missing managed tags."""
-
-    color = os.getenv("OVERLEAF_TAG_COLOR", DEFAULT_TAG_COLOR)
     tag_documents: list[dict[str, Any]] = []
 
     for plan in tag_sync_plans:
@@ -1068,7 +1366,7 @@ def build_tag_documents_to_create(
         tag_documents.append(
             {
                 "__v": 0,
-                "color": color,
+                "color": plan.desired_color,
                 "name": plan.tag_name,
                 "project_ids": plan.desired_raw_project_ids,
                 "user_id": plan.user_id,
@@ -1083,14 +1381,15 @@ def apply_tag_sync_plans(
     mongo_database: str,
     tag_sync_plans: list[TagSyncPlan],
     collection_name: str = "tags",
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Create missing managed tags and sync project_ids on existing tag documents."""
 
     tags_to_create = build_tag_documents_to_create(tag_sync_plans)
+    plans_to_delete = [plan for plan in tag_sync_plans if plan.needs_delete()]
     plans_to_update = [plan for plan in tag_sync_plans if plan.needs_update()]
 
-    if not tags_to_create and not plans_to_update:
-        return 0, 0
+    if not tags_to_create and not plans_to_update and not plans_to_delete:
+        return 0, 0, 0
 
     client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
 
@@ -1099,7 +1398,12 @@ def apply_tag_sync_plans(
         collection = client[mongo_database][collection_name]
 
         created_count = 0
+        deleted_count = 0
         updated_count = 0
+
+        for plan in plans_to_delete:
+            collection.delete_one({"_id": plan.tag_object_id})
+            deleted_count += 1
 
         if tags_to_create:
             created_count = len(
@@ -1109,11 +1413,16 @@ def apply_tag_sync_plans(
         for plan in plans_to_update:
             collection.update_one(
                 {"_id": plan.tag_object_id},
-                {"$set": {"project_ids": plan.desired_raw_project_ids}},
+                {
+                    "$set": {
+                        "color": plan.desired_color,
+                        "project_ids": plan.desired_raw_project_ids,
+                    }
+                },
             )
             updated_count += 1
 
-        return created_count, updated_count
+        return created_count, updated_count, deleted_count
     except PyMongoError as exc:
         raise SystemExit(f"Could not sync tags in MongoDB: {exc}") from exc
     finally:
@@ -1165,7 +1474,20 @@ def print_tag_project_update_plan(tag_sync_plans: list[TagSyncPlan]) -> None:
     for plan in plans_to_update:
         print(
             f"- user_id={plan.user_id} | name={plan.tag_name} | "
+            f"current_color={plan.current_color or '<unset>'} | desired_color={plan.desired_color} | "
             f"current={plan.current_project_ids} | desired={plan.desired_project_ids}"
+        )
+
+
+def print_tag_deletion_plan(tag_sync_plans: list[TagSyncPlan]) -> None:
+    """Print the managed tag documents that will be deleted for ineligible users."""
+
+    plans_to_delete = [plan for plan in tag_sync_plans if plan.needs_delete()]
+    print(f"Prepared {len(plans_to_delete)} managed tag document(s) to delete:")
+
+    for plan in plans_to_delete:
+        print(
+            f"- user_id={plan.user_id} | name={plan.tag_name} | current={plan.current_project_ids}"
         )
 
 
@@ -1237,6 +1559,31 @@ def print_project_access_plans(project_access_plans: list[ProjectAccessPlan]) ->
             print(f"  {field}: current={current_refs} | desired={desired_refs}")
 
 
+def print_project_access_state_sync_plan(
+    state_sync_plans: list[ProjectAccessStateSyncPlan],
+) -> None:
+    """Print the persisted managed-share state documents whose contents will change."""
+
+    changed_plans = [
+        plan for plan in state_sync_plans if plan.needs_create() or plan.needs_update()
+    ]
+    print(
+        f"Prepared {len(changed_plans)} project access state document(s) to create or update:"
+    )
+
+    for plan in changed_plans:
+        action = "create" if plan.needs_create() else "update"
+        print(f"- {action} | {plan.project_name} ({plan.project_id})")
+        for field in PROJECT_ACCESS_FIELDS:
+            current_refs = plan.current_managed_refs_by_field.get(field, [])
+            desired_refs = plan.desired_managed_refs_by_field.get(field, [])
+            if current_refs == desired_refs and action == "update":
+                continue
+            print(
+                f"  {field}: current_managed={current_refs} | desired_managed={desired_refs}"
+            )
+
+
 def main() -> int:
     load_dotenv(Path(__file__).with_name(".env"))
 
@@ -1282,12 +1629,17 @@ def main() -> int:
     overleaf_users = fetch_overleaf_users(overleaf_mongo_uri, overleaf_mongo_db)
     overleaf_tags = fetch_overleaf_tags(overleaf_mongo_uri, overleaf_mongo_db)
     overleaf_projects = fetch_overleaf_projects(overleaf_mongo_uri, overleaf_mongo_db)
+    project_access_states = fetch_project_access_states(
+        overleaf_mongo_uri,
+        overleaf_mongo_db,
+    )
     correlated_users = correlate_users(overleaf_users, authentik_users)
     users_by_group = build_correlated_users_by_authentik_group(correlated_users)
     audited_users = audit_user_tags(correlated_users, overleaf_tags, team_role_mappings)
     project_access_plans = build_project_access_plans(
         overleaf_projects,
         overleaf_tags,
+        project_access_states,
         team_role_mappings,
         correlated_users,
         project_tag_source_mode,
@@ -1306,46 +1658,71 @@ def main() -> int:
         correlated_users,
         project_access_plans,
     )
+    state_sync_plans = build_project_access_state_sync_plans(
+        project_access_plans,
+        project_access_states,
+    )
     tags_to_create = build_tag_documents_to_create(tag_sync_plans)
+    tag_delete_plans = [plan for plan in tag_sync_plans if plan.needs_delete()]
     tag_update_plans = [plan for plan in tag_sync_plans if plan.needs_update()]
+    state_change_plans = [
+        plan for plan in state_sync_plans if plan.needs_create() or plan.needs_update()
+    ]
 
     if tags_to_create:
         print_tag_creation_plan(tags_to_create)
+    if tag_delete_plans:
+        print_tag_deletion_plan(tag_delete_plans)
     if tag_update_plans:
         print_tag_project_update_plan(tag_update_plans)
+    if state_change_plans:
+        print_project_access_state_sync_plan(state_change_plans)
 
-    if tags_to_create or tag_update_plans:
+    if tags_to_create or tag_update_plans or tag_delete_plans:
         if create_tags:
-            created_count, updated_count = apply_tag_sync_plans(
+            created_count, updated_count, deleted_count = apply_tag_sync_plans(
                 overleaf_mongo_uri,
                 overleaf_mongo_db,
                 tag_sync_plans,
             )
             print(
-                f"Created {created_count} tag(s) and updated {updated_count} tag document(s) in Overleaf MongoDB"
+                f"Created {created_count} tag(s), updated {updated_count} tag document(s), and deleted {deleted_count} tag document(s) in Overleaf MongoDB"
             )
         else:
-            print("CREATE_TAGS is false, so tag documents were not created or updated.")
+            print(
+                "CREATE_TAGS is false, so tag documents were not created, updated, or deleted."
+            )
     else:
         print("No tag document changes are required.")
 
     changed_project_count = len(
         [plan for plan in project_access_plans if plan.has_changes()]
     )
-    if changed_project_count:
+    if changed_project_count or state_change_plans:
         if apply_project_access:
-            updated_projects = apply_project_access_plans(
+            updated_projects = 0
+            if changed_project_count:
+                updated_projects = apply_project_access_plans(
+                    overleaf_mongo_uri,
+                    overleaf_mongo_db,
+                    project_access_plans,
+                )
+
+            created_states, updated_states = apply_project_access_state_sync_plans(
                 overleaf_mongo_uri,
                 overleaf_mongo_db,
-                project_access_plans,
+                state_sync_plans,
             )
             print(f"Applied access updates to {updated_projects} project(s).")
+            print(
+                f"Created {created_states} and updated {updated_states} project access state document(s)."
+            )
         else:
             print(
-                "APPLY_PROJECT_ACCESS is false, so project access changes were not applied."
+                "APPLY_PROJECT_ACCESS is false, so project access changes and project access state were not applied."
             )
     else:
-        print("No project access updates are required.")
+        print("No project access or project access state updates are required.")
 
     return 0
 

@@ -71,6 +71,7 @@ config:
   # projectTagSourceMode can be "owner-only" or "any-access"
   projectTagSourceMode: "owner-only"
   overleafTagColor: "#1f75cb"
+  overleafActiveTagColor: "#2f9e44"
 
 extraEnv: []
 extraEnvFrom: []

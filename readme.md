@@ -1,4 +1,6 @@
 # This project aims to provide individuals a way of sharing Overleaf projects in Overleaf CE with everyone in their team by simply using tags
+# It is much easier for a user to share a document with a large group of people by adding a tag to their project than it is to add each individual user to the project, especially if the team is large.
+# This now preserves the built in sharing functionality by tracking which project memberships were added by this script separately from manual shares.
 
 ## Concept
 
@@ -9,13 +11,15 @@ Each team will have multiple tags associated with it, for example team "Threat I
 
 2. The script, will be capable of associating users to given teams through an authentik integration. Each tag created in the previous step will be associated with a group in authentik. the association between users in authentik and overleaf will ideally be done using using the samlIdentifiers[0].externalUserId field in the overleaf users table however if that can't be correlated to anything in authentik, then we can fall back to using the email field in the overleaf users table and the email field in authentik.
 
-3. When the owner of a project as defined by owner_ref in the project records of the mongoDB of overleaf CE adds one of the predefined tags to their project, the script will pick this up on its next run and compare the collaberator_refs, reviewer_refs and readOnly_refs fields to the groups of users it pulls from authentik. If someone has added "TI - Read Only" to their project then it will look for all members of the Threat Intelligence team in authentik and add them to the readOnly_refs field of the project, if someone has added "TI - Collaborator" to their project then it will look for all members of the Threat Intelligence team in authentik and add them to the collaberator_refs field of the project and so on. 
+3. When the owner of a project as defined by owner_ref in the project records of the mongoDB of overleaf CE adds one of the predefined tags to their project, the script will pick this up on its next run and compare the collaberator_refs, reviewer_refs and readOnly_refs fields to the groups of users it pulls from authentik. If someone has added "TI - Read Only" to their project then it will look for all members of the Threat Intelligence team in authentik and add them to the readOnly_refs field of the project, if someone has added "TI - Collaborator" to their project then it will look for all members of the Threat Intelligence team in authentik and add them to the collaberator_refs field of the project and so on.
+
+The script stores the memberships it is responsible for in a separate MongoDB collection called `project_access_states`. On later runs it only removes memberships that were previously managed by the script, so extra collaborators added through Overleaf's built in share flow are preserved.
 
 If the owner of the project is in the team, it will ignore them as they will always have full access to the project.
 
 If the owner adds two different levels of access for the same team, it will remove the lower level of access, for example if the owner adds "TI - Collaborator" and "TI - Read Only" to their project, it will remove all members of the Threat Intelligence team from the readOnly_refs field and add them to the collaberator_refs field, as well as removing the "TI - Read Only" tag from the project.
 
-4. If the owner of the project removes one of the predefined tags from their project, the script will pick this up on its next run and remove all users associated with that tag from the project, for example if the owner removes "TI - Collaborator" from their project, it will look for all members of the Threat Intelligence team in authentik and remove them from the collaberator_refs field of the project.
+4. If the owner of the project removes one of the predefined tags from their project, the script will pick this up on its next run and remove the users that were previously added by the script for that tag from the relevant project field. Users who were added manually through Overleaf sharing are left in place.
 
 ## Docker
 
@@ -61,6 +65,8 @@ Useful optional variables:
 - `CREATE_TAGS`
 - `APPLY_PROJECT_ACCESS`
 - `OVERLEAF_TAG_COLOR`
+
+When `APPLY_PROJECT_ACCESS=true`, the script also maintains the `project_access_states` MongoDB collection so it can distinguish script-managed project memberships from manual shares on future runs.
 
 ## Helm
 

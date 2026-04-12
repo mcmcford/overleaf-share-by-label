@@ -72,6 +72,8 @@ spec:
                   value: {{ .Values.config.projectTagSourceMode | quote }}
                 - name: OVERLEAF_TAG_COLOR
                   value: {{ .Values.config.overleafTagColor | quote }}
+                - name: OVERLEAF_ACTIVE_TAG_COLOR
+                  value: {{ .Values.config.overleafActiveTagColor | quote }}
                 {{- if or .Values.secret.overleafMongoUri .Values.existingSecret }}
                 - name: OVERLEAF_MONGO_URI
                   valueFrom:
