@@ -1,6 +1,6 @@
-# This project aims to provide individuals a way of sharing Overleaf projects in Overleaf CE with everyone in their team by simply using tags
-# It is much easier for a user to share a document with a large group of people by adding a tag to their project than it is to add each individual user to the project, especially if the team is large.
-# This now preserves the built in sharing functionality by tracking which project memberships were added by this script separately from manual shares.
+This project aims to provide individuals a way of sharing Overleaf projects in Overleaf CE with everyone in their team by simply using tags. It is much easier for a user to share a document with a large group of people by adding a tag to their project than it is to add each individual user to the project, especially if the team is large.
+
+This targets a very specific environment that uses both Overleaf CE and Authentik for identity and access management, but the concept could be adapted to other environments with similar needs.
 
 ## Concept
 
