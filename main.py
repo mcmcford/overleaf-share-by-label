@@ -636,6 +636,16 @@ def build_authentik_team_group_name(team_name: str) -> str:
     return f"overleaf-teams-{team_name}"
 
 
+def normalize_email(value: Any) -> str | None:
+    """Normalize email values to lowercase for stable comparisons."""
+
+    if value is None:
+        return None
+
+    normalized_value = str(value).strip().lower()
+    return normalized_value or None
+
+
 def describe_authentik_user(user: dict[str, Any]) -> str:
     """Build a compact Authentik user description for debug logs."""
 
@@ -731,7 +741,7 @@ def initialise_users(overleaf_users: list[dict[str, Any]]):
     for user in overleaf_users:
         ol_objectid_raw = user.get("_id")
         ol_objectid = str(ol_objectid_raw)
-        ol_email = user.get("email")
+        ol_email = normalize_email(user.get("email"))
         ol_saml_identities = []
         for saml in user.get("samlIdentifiers", []):
             ol_saml_identities.append(
@@ -782,9 +792,12 @@ def correlate_users(
 
     correlated_users: list[User] = []
     authentik_users_by_uid = build_authentik_lookup(authentik_users, "uid")
-    authentik_users_by_email = build_authentik_lookup(authentik_users, "email")
-    authentik_users_by_email_casefold = build_authentik_lookup(
-        authentik_users, "email", casefold=True
+    authentik_users_by_email = build_authentik_lookup(
+        [
+            {**authentik_user, "email": normalize_email(authentik_user.get("email"))}
+            for authentik_user in authentik_users
+        ],
+        "email",
     )
 
     logger.debug(
@@ -852,7 +865,7 @@ def correlate_users(
             if email_candidates:
                 if len(email_candidates) > 1:
                     logger.debug(
-                        "Multiple exact email matches for Overleaf user %s email=%s; selecting first candidate: %s",
+                        "Multiple normalized email matches for Overleaf user %s email=%s; selecting first candidate: %s",
                         user.ol_objectid,
                         user.ol_email,
                         "; ".join(
@@ -862,38 +875,24 @@ def correlate_users(
                     )
 
                 matched_authentik_user = email_candidates[0]
-                match_strategy = f"email {user.ol_email}"
+                match_strategy = f"normalized email {user.ol_email}"
                 logger.debug(
-                    "Matched Overleaf user %s to Authentik user via exact email: %s",
+                    "Matched Overleaf user %s to Authentik user via normalized email: %s",
                     user.ol_objectid,
                     describe_authentik_user(matched_authentik_user),
                 )
             else:
-                case_insensitive_candidates = authentik_users_by_email_casefold.get(
-                    user.ol_email.casefold(), []
+                logger.debug(
+                    "No Authentik normalized email fallback match for Overleaf user %s email=%s.",
+                    user.ol_objectid,
+                    user.ol_email,
                 )
-                if case_insensitive_candidates:
-                    logger.debug(
-                        "No exact email match for Overleaf user %s email=%s, but found case-insensitive Authentik candidate(s): %s",
-                        user.ol_objectid,
-                        user.ol_email,
-                        "; ".join(
-                            describe_authentik_user(candidate)
-                            for candidate in case_insensitive_candidates
-                        ),
-                    )
-                else:
-                    logger.debug(
-                        "No Authentik email fallback match for Overleaf user %s email=%s.",
-                        user.ol_objectid,
-                        user.ol_email,
-                    )
 
         if matched_authentik_user:
             user.authentik_pk = matched_authentik_user.get("pk")
             user.authentik_username = matched_authentik_user.get("username")
             user.authentik_name = matched_authentik_user.get("name")
-            user.authentik_email = matched_authentik_user.get("email")
+            user.authentik_email = normalize_email(matched_authentik_user.get("email"))
             user.authentik_is_active = matched_authentik_user.get("is_active")
             user.authentik_uid = matched_authentik_user.get("uid")
             user.authentik_group_names = sorted(
