@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from urllib.request import Request, urlopen
 
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -149,6 +152,23 @@ def load_dotenv(dotenv_path: Path) -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         os.environ.setdefault(key, value)
+
+
+def configure_logging() -> None:
+    """Configure standard logging from LOG_LEVEL once env vars have been loaded."""
+
+    log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    log_level = getattr(logging, log_level_name, None)
+
+    if not isinstance(log_level, int):
+        raise SystemExit(
+            f"Invalid LOG_LEVEL '{log_level_name}'. Expected a standard logging level such as DEBUG, INFO, WARNING, ERROR, or CRITICAL."
+        )
+
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 
 
 def get_required_env(name: str, aliases: tuple[str, ...] = ()) -> str:
@@ -616,6 +636,68 @@ def build_authentik_team_group_name(team_name: str) -> str:
     return f"overleaf-teams-{team_name}"
 
 
+def describe_authentik_user(user: dict[str, Any]) -> str:
+    """Build a compact Authentik user description for debug logs."""
+
+    return (
+        f"pk={user.get('pk')} username={user.get('username') or '<no-username>'} "
+        f"email={user.get('email') or '<no-email>'} uid={user.get('uid') or '<no-uid>'}"
+    )
+
+
+def build_authentik_lookup(
+    authentik_users: list[dict[str, Any]],
+    field_name: str,
+    *,
+    casefold: bool = False,
+) -> dict[str, list[dict[str, Any]]]:
+    """Group Authentik users by a chosen field while preserving payload order."""
+
+    lookup: dict[str, list[dict[str, Any]]] = {}
+
+    for authentik_user in authentik_users:
+        raw_value = authentik_user.get(field_name)
+        if raw_value is None:
+            continue
+
+        value = str(raw_value).strip()
+        if not value:
+            continue
+
+        if casefold:
+            value = value.casefold()
+
+        lookup.setdefault(value, []).append(authentik_user)
+
+    return lookup
+
+
+def log_duplicate_authentik_lookup_values(
+    lookup: dict[str, list[dict[str, Any]]], field_name: str
+) -> None:
+    """Emit debug logs for ambiguous Authentik identifiers."""
+
+    duplicate_values = {
+        value: users for value, users in lookup.items() if len(users) > 1
+    }
+
+    if not duplicate_values:
+        return
+
+    logger.debug(
+        "Found %d duplicate Authentik %s value(s) that may make correlation ambiguous.",
+        len(duplicate_values),
+        field_name,
+    )
+    for value, users in sorted(duplicate_values.items()):
+        logger.debug(
+            "Ambiguous Authentik %s='%s': %s",
+            field_name,
+            value,
+            "; ".join(describe_authentik_user(user) for user in users),
+        )
+
+
 def build_team_role_mappings(team_names: list[str]) -> list[TeamRoleMapping]:
     """Build the canonical mapping objects linking Overleaf role tags to team groups."""
 
@@ -699,22 +781,113 @@ def correlate_users(
     """
 
     correlated_users: list[User] = []
+    authentik_users_by_uid = build_authentik_lookup(authentik_users, "uid")
+    authentik_users_by_email = build_authentik_lookup(authentik_users, "email")
+    authentik_users_by_email_casefold = build_authentik_lookup(
+        authentik_users, "email", casefold=True
+    )
+
+    logger.debug(
+        "Starting correlation for %d Overleaf user(s) against %d Authentik user(s).",
+        len(overleaf_users),
+        len(authentik_users),
+    )
+    log_duplicate_authentik_lookup_values(authentik_users_by_uid, "uid")
+    log_duplicate_authentik_lookup_values(authentik_users_by_email, "email")
 
     for user in initialise_users(overleaf_users):
         matched_authentik_user = None
+        match_strategy = ""
+        saml_external_ids = [
+            identity.externalUserId.strip()
+            for identity in user.ol_saml_identities
+            if identity.externalUserId.strip()
+        ]
+
+        logger.debug(
+            "Correlating Overleaf user ol_objectid=%s email=%s saml_external_user_ids=%s",
+            user.ol_objectid,
+            user.ol_email or "<no-email>",
+            saml_external_ids or ["<none>"],
+        )
+
         for saml_identity in user.ol_saml_identities:
-            for authentik_user in authentik_users:
-                if saml_identity.externalUserId == authentik_user.get("uid"):
-                    matched_authentik_user = authentik_user
-                    break
+            external_user_id = saml_identity.externalUserId.strip()
+            if not external_user_id:
+                continue
+
+            matched_candidates = authentik_users_by_uid.get(external_user_id, [])
+            if not matched_candidates:
+                logger.debug(
+                    "No Authentik uid match for Overleaf user %s via SAML externalUserId=%s providerId=%s.",
+                    user.ol_objectid,
+                    external_user_id,
+                    saml_identity.providerId or "<unknown>",
+                )
+                continue
+
+            if len(matched_candidates) > 1:
+                logger.debug(
+                    "Multiple Authentik uid matches for Overleaf user %s via externalUserId=%s; selecting first candidate: %s",
+                    user.ol_objectid,
+                    external_user_id,
+                    "; ".join(
+                        describe_authentik_user(candidate)
+                        for candidate in matched_candidates
+                    ),
+                )
+
+            matched_authentik_user = matched_candidates[0]
+            match_strategy = f"saml uid {external_user_id}"
+            logger.debug(
+                "Matched Overleaf user %s to Authentik user via SAML uid: %s",
+                user.ol_objectid,
+                describe_authentik_user(matched_authentik_user),
+            )
             if matched_authentik_user:
                 break
 
         if not matched_authentik_user and user.ol_email:
-            for authentik_user in authentik_users:
-                if user.ol_email == authentik_user.get("email"):
-                    matched_authentik_user = authentik_user
-                    break
+            email_candidates = authentik_users_by_email.get(user.ol_email, [])
+            if email_candidates:
+                if len(email_candidates) > 1:
+                    logger.debug(
+                        "Multiple exact email matches for Overleaf user %s email=%s; selecting first candidate: %s",
+                        user.ol_objectid,
+                        user.ol_email,
+                        "; ".join(
+                            describe_authentik_user(candidate)
+                            for candidate in email_candidates
+                        ),
+                    )
+
+                matched_authentik_user = email_candidates[0]
+                match_strategy = f"email {user.ol_email}"
+                logger.debug(
+                    "Matched Overleaf user %s to Authentik user via exact email: %s",
+                    user.ol_objectid,
+                    describe_authentik_user(matched_authentik_user),
+                )
+            else:
+                case_insensitive_candidates = authentik_users_by_email_casefold.get(
+                    user.ol_email.casefold(), []
+                )
+                if case_insensitive_candidates:
+                    logger.debug(
+                        "No exact email match for Overleaf user %s email=%s, but found case-insensitive Authentik candidate(s): %s",
+                        user.ol_objectid,
+                        user.ol_email,
+                        "; ".join(
+                            describe_authentik_user(candidate)
+                            for candidate in case_insensitive_candidates
+                        ),
+                    )
+                else:
+                    logger.debug(
+                        "No Authentik email fallback match for Overleaf user %s email=%s.",
+                        user.ol_objectid,
+                        user.ol_email,
+                    )
 
         if matched_authentik_user:
             user.authentik_pk = matched_authentik_user.get("pk")
@@ -728,8 +901,27 @@ def correlate_users(
                 for group_name in matched_authentik_user.get("group_names", [])
                 if group_name
             )
+            logger.debug(
+                "Correlation result for Overleaf user %s: matched via %s with groups=%s",
+                user.ol_objectid,
+                match_strategy,
+                user.authentik_group_names,
+            )
+        else:
+            logger.debug(
+                "Correlation result for Overleaf user %s: unmatched. email=%s saml_external_user_ids=%s",
+                user.ol_objectid,
+                user.ol_email or "<no-email>",
+                saml_external_ids or ["<none>"],
+            )
 
         correlated_users.append(user)
+
+    logger.debug(
+        "Finished correlation: %d matched, %d unmatched.",
+        len([user for user in correlated_users if user.is_correlated()]),
+        len([user for user in correlated_users if not user.is_correlated()]),
+    )
 
     return correlated_users
 
@@ -1586,6 +1778,7 @@ def print_project_access_state_sync_plan(
 
 def main() -> int:
     load_dotenv(Path(__file__).with_name(".env"))
+    configure_logging()
 
     base_url = get_required_env("AUTHENTIK_URL", aliases=("AUTHENTIK_BASE_URL",))
     token = get_required_env("AUTHENTIK_TOKEN", aliases=("AUTHENTIK_API_TOKEN",))
