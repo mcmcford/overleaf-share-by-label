@@ -9,8 +9,6 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py ./
-COPY readme.md ./
-COPY datastructures.md ./
 
 RUN addgroup --gid 10001 appuser \
     && adduser --disabled-password --gecos "" --uid 10001 --gid 10001 appuser \
